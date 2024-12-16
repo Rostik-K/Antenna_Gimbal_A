@@ -10,14 +10,18 @@
 /* CONFIGS  */
 
 #define DEBUG   // Adds UART output to funcitons
+
+// #define TEST_GIMBAL_UART
+
 //  #define TEST_GIMBAL_YAW
 //  #define TEST_GIMBAL_PITCH    
 //  #define TEST_GIMBAL_SYNC
 
+  #define TEST_SERVO_FEEDBACK
 //  #define TEST_GIMBAL_IMU
 //  #define TEST_GIMBAL_HEADING
-//   #define PRINT_MAG   1
-//   #define PRINT_ACC   1
+//    #define PRINT_MAG   1
+//    #define PRINT_ACC   1
 //    #define PRINT_GYRO  1
 
 #define LED_PIN 25
@@ -38,15 +42,16 @@
 // Servo Config
 #define YAW_SERVO_ID      1 //-- YAW     ?????
 #define PITCH_SERVO_ID    2 //-- PITCH
-#define PITCH_MAX_LIMIT   600            // CS09 Servos by Waveshare initialy have 0-300 degrees controlled rotation angle. And due it`s design we should use 0-1023 range int values respectively.
-#define PITCH_MIN_LIMIT   250
-#define YAW_MAX_LIMIT     1023
-#define YAW_MIN_LIMIT     0
+#define PITCH_MAX_LIMIT   640            // CS09 Servos by Waveshare initialy have 0-300 degrees controlled rotation angle. And due it`s design we should use 0-1023 range int values respectively.
+#define PITCH_MIN_LIMIT   280
+#define YAW_MAX_LIMIT     1000    // As 0 
+#define YAW_MIN_LIMIT     0       // As 300
 
 // Gayball Config
 #define DEMPHER_VALUE_DEGREES         1
 #define DEMPHER_PITCH_VALUE_DEGREES   1
 #define AIMED_PITCH                   200
+#define SMOOTHING_STEPS  8
 
 // Filtering
 // Alpha low pass filter
@@ -59,50 +64,70 @@
   #define LOG(x) // No-op
 #endif
 
-//#define PITCH_WRITE(pos) sc.WritePos(PITCH_SERVO_ID, pos, 0, 1500)
-float filteredPitch = 0.0;
-
 // Gayball Variables
-float aimedHeading;
-float pitch;
-float roll;
-const int startingHeadServoPos = 250;
-int previousHeadingFix = startingHeadServoPos;
+int base_yaw = 0;
+int base_pitch = 0;
+
+float aimed_heading = 0;
+float pitchHistory[SMOOTHING_STEPS];
+int magHistoryPosition = 0;
+
 int previousPitch = 0;
-const int targetAngle = -40; 
+const int targetAngle = 0; 
 
 float filteredYaw = 0.0;              // Filtered yaw angle
 float targetAzimuth = 90.0;           // Target azimuth in degrees
 
+// KALMAN
+double pitch = 0, roll = 0, yaw = 0;  // Orientation angles (degrees)
+double dt = 0.02;    
+
+double Q_angle = 0.1;  // Process noise variance for the accelerometer
+double Q_bias = 0.003;   // Process noise variance for the gyroscope bias
+double R_measure = 0.03; // Measurement noise variance
+double angle = 0, bias = 0, rate = 0; // Kalman filter state variables
+double P[2][2] = {{0, 0}, {0, 0}};    // Error covariance matrix
+ 
+unsigned long lastTime; // For calculating loop time
 
 // Base instances
 ESL_LIS3MDL mag(&I2C_1);
 LSM6 imu;
 SCSCL sc;
 
-float getPitch(int16_t x, int16_t z) {
-  return atan2(x, z) * 180.0 / M_PI; // Convert from radians to degrees
-}
-
-float getAzimuth(float mx, float my) {
-  float azimuth = atan2(my, mx) * (180.0 / M_PI); // Convert radians to degrees
-  if (azimuth < 0) {
-    azimuth += 360.0; // Normalize to 0-360 degrees
-  }
-  return azimuth;
-}
-
 void setup() {
-  // LED
+  // Indication LED init 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
-  // LED
 
   // USB Serial Init
   DEBUG_SERIAL.begin(DEBUG_SERIAL_SPEED);
   //while(!DEBUG_SERIAL) {delay(10);}           // BUG
   delay(100);
   LOG("USB Serial Enabled!");
+
+  // Servo Serial Init
+  SERVO_SERIAL.setTX(TXD_PIN);
+  SERVO_SERIAL.setRX(RXD_PIN);
+  SERVO_SERIAL.begin(1000000);
+
+  if (!SERVO_SERIAL) {
+    LOG("Failed to initialize UART for Servos!");
+    while(1);
+  } 
+  sc.pSerial = &SERVO_SERIAL; // Give specific Serial to Servo
+  LOG("UART Serial for servo Enabled!");
+
+  // Test gimbal servos
+  #ifdef TEST_GIMBAL_PITCH
+    //LOG("Gimbal PITCH test started!");
+    while(1) {testServo(PITCH_SERVO_ID, &sc,  &DEBUG_SERIAL, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);}
+  #endif
+
+  #ifdef TEST_GIMBAL_YAW
+   // LOG("Gimbal YAW test started!");
+    while(1) {testServo(YAW_SERVO_ID, &sc, &DEBUG_SERIAL, YAW_MIN_LIMIT, YAW_MAX_LIMIT);}
+  #endif
 
   // I2C Init
   /*
@@ -113,7 +138,6 @@ void setup() {
   I2C_1.setSCL(I2C_SCL_PIN);
   I2C_1.begin();
   imu.setBus(&I2C_1); // Set specific I2C to IMU unit.
-
 
   // Magnetometer Init
   if(!mag.init()) {
@@ -133,28 +157,18 @@ void setup() {
   }
   imu.enableDefault();  // Enable Default settings for IMU
 
-  // Servo Serial Init
-  SERVO_SERIAL.setTX(TXD_PIN);
-  SERVO_SERIAL.setRX(RXD_PIN);
-  SERVO_SERIAL.begin(1000000);
-  if (!SERVO_SERIAL) {
-    LOG("Failed to initialize UART for Servos!");
-    while(1);
-  } 
-  sc.pSerial = &SERVO_SERIAL; // Give specific Serial to Servo
-  LOG("UART Serial for servo Enabled!");
-
-  // Test gimbal servos
-  #ifdef TEST_GIMBAL_PITCH
-    LOG("Gimbal PITCH test started!");
-    while(1) {testServo(PITCH_SERVO_ID, &sc,  &DEBUG_SERIAL, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);}
+  // Test different UART output
+  #if defined(DEBUG) && defined(TEST_GIMBAL_UART)
+    while(1) {
+      // USB
+      DEBUG_SERIAL.println("HELLO FROM USB!");
+      // UART0
+      SDCARD_SERIAL.println("HELLO FROM UART0!");
+      // UART1
+      delay(500);
+    }
   #endif
-
-  #ifdef TEST_GIMBAL_YAW
-   // LOG("Gimbal YAW test started!");
-    while(1) {testServo(YAW_SERVO_ID, &sc, &DEBUG_SERIAL, YAW_MIN_LIMIT, YAW_MAX_LIMIT);}
-  #endif
-
+  // Test 2 Servo rotation in sync
   #if defined(DEBUG) && defined(TEST_GIMBAL_SYNC)
     u8 id_array[] = {YAW_SERVO_ID, PITCH_SERVO_ID};
     u8 servoCount = sizeof(id_array);        // Number of servos
@@ -176,7 +190,6 @@ void setup() {
         delay(3000);                         // Wait for movement to complete
     }
   #endif
-
   // Test IMU 
   #if defined(DEBUG) && defined(TEST_GIMBAL_IMU)
     while(1) {
@@ -185,55 +198,111 @@ void setup() {
       printImuRawData(&I2C_1, &DEBUG_SERIAL);
     }
   #endif
-
+  // Just calculate heading 
   #if defined(DEBUG) && defined(TEST_GIMBAL_HEADING)
     while(1) {LOG(heading());}
   #endif
-  
-  pinMode(LED_PIN, OUTPUT);
+
+  #if defined(DEBUG) && defined(TEST_SERVO_FEEDBACK)
+    int pitch_pos = 0;
+    int yaw_pos = 0; 
+    while(1) {
+      yaw_pos = sc.ReadPos(YAW_SERVO_ID);
+      pitch_pos = sc.ReadPos(PITCH_SERVO_ID);
+
+      DEBUG_SERIAL.print("YAW Pos: ");
+      DEBUG_SERIAL.print(yaw_pos);
+      DEBUG_SERIAL.print(". ");
+
+      DEBUG_SERIAL.print("PITCH Pos: ");
+      DEBUG_SERIAL.print(pitch_pos);
+      DEBUG_SERIAL.println("."); 
+  #endif
 
   // Setup delay
-
   delay(1000); 
+
+  // Initial Gimbal Setups
+    // Calibrate MAG
+  setImuBasePosition(); // mb take north as reference point 
+  setBasePosition(&base_yaw, &base_pitch);
+
+  DEBUG_SERIAL.print("BASE YAW / PITCH: ");
+  DEBUG_SERIAL.print(base_yaw);
+  DEBUG_SERIAL.print(" | ");
+  DEBUG_SERIAL.println(base_pitch);
+
 }
 
 void loop() {
 
   // COMBINE (NO SYNC)
   // Read IMU data for pitch compensation
-  imu.read();
-  mag.read();
+  /*   
+    imu.read();
+    mag.read();
 
-  // Calculate azimuth (yaw) using the magnetometer data
-  float yaw = getAzimuth(mag.m.x, mag.m.y);
-  float pitch = getPitch(imu.a.x, imu.a.z); // Get raw pitch from IMU
-
-
-  // Apply low-pass filter for stability
-  filteredYaw = ALPHA * yaw + (1.0 - ALPHA) * filteredYaw;
-  filteredPitch = ALPHA * pitch + (1.0 - ALPHA) * filteredPitch;
-
-  // Calculate the compensation angle
-  float compensationAngleYaw = targetAzimuth - filteredYaw;
-  float compensationAnglePitch = targetAngle - filteredPitch;
-
-  // Map the compensation angle to the servo's position range
-  int positionYaw = map(compensationAngleYaw, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
-  positionYaw = constrain(positionYaw, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
-
-  int positionPitch = map(compensationAnglePitch, -60, 60, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
-  positionPitch = constrain(positionPitch, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
-
-  // Send the position to the servo
-  sc.WritePos(YAW_SERVO_ID, positionYaw, 0, 1500);
-  sc.WritePos(PITCH_SERVO_ID, positionPitch, 0, 1500);   
+    // Calculate azimuth (yaw) using the magnetometer data
+    //float yaw = getAzimuth(mag.m.x, mag.m.y);
+    float yaw = heading();
+    float pitch = getPitch(imu.a.x, imu.a.z); // Get raw pitch from IMU
 
 
-  // Delay for stability
-  delay(20);
+    // Apply low-pass filter for stability
+    filteredYaw = ALPHA * yaw + (1.0 - ALPHA) * filteredYaw;
+    filteredPitch = ALPHA * pitch + (1.0 - ALPHA) * filteredPitch;
+
+    // Calculate the compensation angle
+    float compensationAngleYaw = targetAzimuth - filteredYaw;
+    float compensationAnglePitch = targetAngle - filteredPitch;
+
+    // Map the compensation angle to the servo's position range
+    int positionYaw = map(compensationAngleYaw, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+    positionYaw = constrain(positionYaw, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+
+    int positionPitch = map(compensationAnglePitch, -60, 60, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
+    positionPitch = constrain(positionPitch, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
+
+    // Send the position to the servo
+    sc.WritePos(YAW_SERVO_ID, positionYaw, 0, 1500);
+    sc.WritePos(PITCH_SERVO_ID, positionPitch, 0, 1500);   
+    // Delay for stability
+    delay(20); */
 
   // PITCH TEST
 
+  /*   unsigned long currentTime = millis();
+    dt = (currentTime - lastTime) / 1000.0; // Calculate time in seconds
+    if (dt == 0) dt = 0.001;               // Prevent division by zero
+    lastTime = currentTime;
+
+    pitch = Kalman_filter(pitch, mag.m.x, atan2(-imu.a.x, sqrt(imu.a.y * imu.a.y + imu.a.z * imu.a.z)) * 180.0 / M_PI);
+      
+    float compensationAnglePitch = targetAngle - pitch;
+
+    int positionPitch = map(compensationAnglePitch, -60, 60, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
+    positionPitch = constrain(positionPitch, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
+  */
+
+  /*   
+    yaw = atan2(mag.m.x, mag.m.y); // Calculate yaw from magnetometer readings
+    float declinationAngle = -0.1783; // Declination in radians for -10° 13'
+    yaw += declinationAngle;          // Adjust for magnetic declination
+  
+    // Normalize yaw to 0-360 degrees
+    if (yaw < 0) yaw += 2 * PI;
+    if (yaw > 2 * PI) yaw -= 2 * PI;
+    yaw = yaw * 180.0 / PI; // Convert yaw to degrees
+  
+    float compensationAngleYaw = targetAngle - yaw;
+    int positionYaw = map(compensationAngleYaw, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+    positionYaw = constrain(positionYaw, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+
+    sc.WritePos(PITCH_SERVO_ID, positionPitch, 0, 2000);
+    sc.WritePos(YAW_SERVO_ID, positionYaw, 0, 2000);
+  */
+
+  delay(20);
   // YAW TEST  (BAD)
   /*    
         mag.read();
@@ -255,8 +324,6 @@ void loop() {
         LOG(position);
 
         delay(20); // Main loop delay  */  
-      
-    
 }
 
 /*
@@ -306,6 +373,17 @@ float heading(void) {
   return heading;
 }
 
+float getPitch(int16_t x, int16_t z) {
+  return atan2(x, z) * 180.0 / M_PI; // Convert from radians to degrees
+}
+
+float getAzimuth(float mx, float my) {
+  float azimuth = atan2(my, mx) * (180.0 / M_PI); // Convert radians to degrees
+  if (azimuth < 0) {
+    azimuth += 360.0; // Normalize to 0-360 degrees
+  }
+  return azimuth;
+}
 
 // TEST-/-DEBUG Functions
 void testServo(byte servo_id, SCSCL* servo, HardwareSerial* serial, int min_limit, int max_limit) {
@@ -352,8 +430,100 @@ void printImuRawData(TwoWire* imu_addres, HardwareSerial* output_stream) {
   #endif
 }
 
+double Kalman_filter(double angle, double gyroRate, double accelAngle) {
+  // Predict
+  rate = gyroRate - bias;
+  angle += dt * rate;
+ 
+  P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle);
+  P[0][1] -= dt * P[1][1];
+  P[1][0] -= dt * P[1][1];
+  P[1][1] += Q_bias * dt;
+ 
+  // Update
+  double S = P[0][0] + R_measure; // Estimate error
+  double K[2];                    // Kalman gain
+  K[0] = P[0][0] / S;
+  K[1] = P[1][0] / S;
+ 
+  double y = accelAngle - angle; // Angle difference
+  angle += K[0] * y;
+  bias += K[1] * y;
+ 
+  double P00_temp = P[0][0];
+  double P01_temp = P[0][1];
+ 
+  P[0][0] -= K[0] * P00_temp;
+  P[0][1] -= K[0] * P01_temp;
+  P[1][0] -= K[1] * P00_temp;
+  P[1][1] -= K[1] * P01_temp;
+ 
+  return angle;
+}
+
+void setBasePosition(int* base_yaw_pos, int* base_pitch_pos) {
+  // Take 40 samples of position feedback of each axis
+  int sample_num = 40;
+  int yaw_pos_sum = 0;
+  int pitch_pos_sum = 0;
+  int yaw_pos_data[sample_num] = {0};
+  int pitch_pos_data[sample_num] = {0};
+
+  for(int i = 0; i < sample_num; i++) {
+    yaw_pos_data[i] = sc.ReadPos(YAW_SERVO_ID);
+    pitch_pos_data[i] = sc.ReadPos(PITCH_SERVO_ID);
+    delay(10); // delay for stability
+  }
+
+  // get average and set BASE
+  for(int i = 0; i < sample_num; i++) {
+    yaw_pos_sum += yaw_pos_data[i];
+    pitch_pos_sum += pitch_pos_data[i];
+  }
+
+  *base_yaw_pos = yaw_pos_sum / sample_num;
+  *base_pitch_pos = pitch_pos_sum / sample_num;
+
+  #ifdef DEBUG
+    DEBUG_SERIAL.print("YAW BASE = ");
+    DEBUG_SERIAL.print(*base_yaw_pos);
+    DEBUG_SERIAL.print(", ");
+    DEBUG_SERIAL.print("PITCH BASE = ");
+    DEBUG_SERIAL.print(*base_pitch_pos);
+    DEBUG_SERIAL.println(".");
+  #endif
+}
+
+void setImuBasePosition(void) {
+  float controlHeading;
+  
+  // 8 times blink 0.5 seconds
+  /*   for (int i = 0; i < 9; i++)
+  {
+    digitalWrite(LED_ONBRD_PIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+    delay(500);                       // wait for a second
+    digitalWrite(LED_ONBRD_PIN, LOW);    // turn the LED off by making the voltage LOW
+    delay(500);                       // wait for a second
+  } */
+
+  // Fix the required direction
+  aimed_heading = 0;
+  magHistoryPosition = 0;
+  while (magHistoryPosition < SMOOTHING_STEPS)
+  {
+    controlHeading = heading();
+    pitchHistory[magHistoryPosition] = (pitch * 180) / PI;
+    aimed_heading += controlHeading;
+    delay(50);
+    magHistoryPosition++;
+  }
+  magHistoryPosition = 0;
+  aimed_heading = controlHeading;
+}
+
+
 /*
- float currentHeading;
+  float currentHeading;
   float currentPitch;
   float currentRoll;
 
