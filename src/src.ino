@@ -17,7 +17,7 @@
 //  #define TEST_GIMBAL_PITCH    
 //  #define TEST_GIMBAL_SYNC
 
-  #define TEST_SERVO_FEEDBACK
+//  #define TEST_SERVO_FEEDBACK
 //  #define TEST_GIMBAL_IMU
 //  #define TEST_GIMBAL_HEADING
 //    #define PRINT_MAG   1
@@ -43,15 +43,21 @@
 #define YAW_SERVO_ID      1 //-- YAW     ?????
 #define PITCH_SERVO_ID    2 //-- PITCH
 #define PITCH_MAX_LIMIT   640            // CS09 Servos by Waveshare initialy have 0-300 degrees controlled rotation angle. And due it`s design we should use 0-1023 range int values respectively.
-#define PITCH_MIN_LIMIT   280
+#define PITCH_MIN_LIMIT   274
 #define YAW_MAX_LIMIT     1000    // As 0 
 #define YAW_MIN_LIMIT     0       // As 300
+
+// GIMBAL Angle limits
+#define PITCH_MIN_ANGLE   0
+#define PITCH_MAX_ANGLE   115
+#define YAW_MIN_ANGLE     0
+#define YAW_MAX_ANGLE     300
 
 // Gayball Config
 #define DEMPHER_VALUE_DEGREES         1
 #define DEMPHER_PITCH_VALUE_DEGREES   1
 #define AIMED_PITCH                   200
-#define SMOOTHING_STEPS  8
+#define SMOOTHING_STEPS  4
 
 // Filtering
 // Alpha low pass filter
@@ -65,24 +71,30 @@
 #endif
 
 // Gayball Variables
-int base_yaw = 0;
-int base_pitch = 0;
-
+int base_servo_yaw = 0;
+int base_servo_yaw_degrees = 0;
+int base_servo_pitch = 0;
 float aimed_heading = 0;
+
+
+
 float pitchHistory[SMOOTHING_STEPS];
 int magHistoryPosition = 0;
+
+
+
 
 int previousPitch = 0;
 const int targetAngle = 0; 
 
 float filteredYaw = 0.0;              // Filtered yaw angle
-float targetAzimuth = 90.0;           // Target azimuth in degrees
+float targetAzimuth = 0.0;           // Target azimuth in degrees
 
 // KALMAN
 double pitch = 0, roll = 0, yaw = 0;  // Orientation angles (degrees)
 double dt = 0.02;    
 
-double Q_angle = 0.1;  // Process noise variance for the accelerometer
+double Q_angle = 0.001;  // Process noise variance for the accelerometer
 double Q_bias = 0.003;   // Process noise variance for the gyroscope bias
 double R_measure = 0.03; // Measurement noise variance
 double angle = 0, bias = 0, rate = 0; // Kalman filter state variables
@@ -123,17 +135,12 @@ void setup() {
     //LOG("Gimbal PITCH test started!");
     while(1) {testServo(PITCH_SERVO_ID, &sc,  &DEBUG_SERIAL, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);}
   #endif
-
   #ifdef TEST_GIMBAL_YAW
    // LOG("Gimbal YAW test started!");
     while(1) {testServo(YAW_SERVO_ID, &sc, &DEBUG_SERIAL, YAW_MIN_LIMIT, YAW_MAX_LIMIT);}
   #endif
 
   // I2C Init
-  /*
-   *  TODO: 
-   *     Validate if particularx Sensor propertly works.
-   */
   I2C_1.setSDA(I2C_SDA_PIN);
   I2C_1.setSCL(I2C_SCL_PIN);
   I2C_1.begin();
@@ -202,7 +209,6 @@ void setup() {
   #if defined(DEBUG) && defined(TEST_GIMBAL_HEADING)
     while(1) {LOG(heading());}
   #endif
-
   #if defined(DEBUG) && defined(TEST_SERVO_FEEDBACK)
     int pitch_pos = 0;
     int yaw_pos = 0; 
@@ -217,118 +223,127 @@ void setup() {
       DEBUG_SERIAL.print("PITCH Pos: ");
       DEBUG_SERIAL.print(pitch_pos);
       DEBUG_SERIAL.println("."); 
+    }
   #endif
-
   // Setup delay
   delay(1000); 
 
   // Initial Gimbal Setups
-    // Calibrate MAG
-  setImuBasePosition(); // mb take north as reference point 
-  setBasePosition(&base_yaw, &base_pitch);
+  // Calibrate MAG
+ // setImuBasePosition(); // mb take north as reference point 
+  DEBUG_SERIAL.print("AIMED HEADING (before setup) = ");
+  DEBUG_SERIAL.println(aimed_heading);
 
-  DEBUG_SERIAL.print("BASE YAW / PITCH: ");
-  DEBUG_SERIAL.print(base_yaw);
-  DEBUG_SERIAL.print(" | ");
-  DEBUG_SERIAL.println(base_pitch);
+  setBasePosition(&base_servo_yaw, &base_servo_pitch);
+  aimedDirectionSetup();
 
+  #ifdef DEBUG
+    DEBUG_SERIAL.print("BASE YAW / PITCH: ");
+    DEBUG_SERIAL.print(base_servo_yaw);
+    DEBUG_SERIAL.print(" | ");
+    DEBUG_SERIAL.println(base_servo_pitch);
+
+    DEBUG_SERIAL.print("AIMED HEADING = ");
+    DEBUG_SERIAL.println(aimed_heading);
+  #endif
 }
 
 void loop() {
 
-  // COMBINE (NO SYNC)
-  // Read IMU data for pitch compensation
-  /*   
-    imu.read();
-    mag.read();
+/* 
+  imu.read();
+  mag.read();
 
-    // Calculate azimuth (yaw) using the magnetometer data
-    //float yaw = getAzimuth(mag.m.x, mag.m.y);
-    float yaw = heading();
-    float pitch = getPitch(imu.a.x, imu.a.z); // Get raw pitch from IMU
+  //convert base_servo_yaw and base_servo_pitch values(MIN-MAX) to yaw and pitch degrees(0-300, 0-115)
+  int base_servo_pitch_degrees = map(base_servo_pitch, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT, PITCH_MIN_ANGLE, PITCH_MAX_ANGLE);
+  base_servo_pitch_degrees = constrain(base_servo_pitch_degrees, PITCH_MIN_ANGLE, PITCH_MAX_ANGLE);
 
+  int base_servo_yaw_degrees = map(base_servo_yaw, YAW_MIN_LIMIT, YAW_MAX_LIMIT, YAW_MIN_ANGLE, YAW_MAX_ANGLE);
+  base_servo_yaw_degrees = constrain(base_servo_yaw_degrees, YAW_MIN_ANGLE, YAW_MAX_ANGLE);
 
-    // Apply low-pass filter for stability
-    filteredYaw = ALPHA * yaw + (1.0 - ALPHA) * filteredYaw;
-    filteredPitch = ALPHA * pitch + (1.0 - ALPHA) * filteredPitch;
-
-    // Calculate the compensation angle
-    float compensationAngleYaw = targetAzimuth - filteredYaw;
-    float compensationAnglePitch = targetAngle - filteredPitch;
-
-    // Map the compensation angle to the servo's position range
-    int positionYaw = map(compensationAngleYaw, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
-    positionYaw = constrain(positionYaw, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
-
-    int positionPitch = map(compensationAnglePitch, -60, 60, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
-    positionPitch = constrain(positionPitch, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
-
-    // Send the position to the servo
-    sc.WritePos(YAW_SERVO_ID, positionYaw, 0, 1500);
-    sc.WritePos(PITCH_SERVO_ID, positionPitch, 0, 1500);   
-    // Delay for stability
-    delay(20); */
-
-  // PITCH TEST
-
-  /*   unsigned long currentTime = millis();
-    dt = (currentTime - lastTime) / 1000.0; // Calculate time in seconds
-    if (dt == 0) dt = 0.001;               // Prevent division by zero
-    lastTime = currentTime;
-
-    pitch = Kalman_filter(pitch, mag.m.x, atan2(-imu.a.x, sqrt(imu.a.y * imu.a.y + imu.a.z * imu.a.z)) * 180.0 / M_PI);
-      
-    float compensationAnglePitch = targetAngle - pitch;
-
-    int positionPitch = map(compensationAnglePitch, -60, 60, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
-    positionPitch = constrain(positionPitch, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
-  */
-
-  /*   
-    yaw = atan2(mag.m.x, mag.m.y); // Calculate yaw from magnetometer readings
-    float declinationAngle = -0.1783; // Declination in radians for -10° 13'
-    yaw += declinationAngle;          // Adjust for magnetic declination
+  float currentHeading;
+  int previousHeadingFix = base_servo_yaw_degrees;
+*/
   
-    // Normalize yaw to 0-360 degrees
-    if (yaw < 0) yaw += 2 * PI;
-    if (yaw > 2 * PI) yaw -= 2 * PI;
-    yaw = yaw * 180.0 / PI; // Convert yaw to degrees
+
+  mag.read();
+  imu.read();
+  // Calculate azimuth (yaw) using the magnetometer
+  //float yaw = getAzimuth(mag.m.x, mag.m.y);
+
+  float yaw = heading();
+  // Low-pass filter to smooth the yaw value
+  filteredYaw = ALPHA * yaw + (1.0 - ALPHA) * filteredYaw;
+
+  // Calculate the compensation angle  // GET TARGET FROM aimedDirectionSetup() aimed_heading
+  float compensationAngle = aimed_heading - filteredYaw;
+
+  // Map the compensation angle to the servo's position range
+  int position = map(compensationAngle, 0, 300, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+  position = constrain(position, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+
+  // Send the position to the servo
+  sc.WritePos(YAW_SERVO_ID, position, 0, 2000);
   
-    float compensationAngleYaw = targetAngle - yaw;
-    int positionYaw = map(compensationAngleYaw, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
-    positionYaw = constrain(positionYaw, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
-
-    sc.WritePos(PITCH_SERVO_ID, positionPitch, 0, 2000);
-    sc.WritePos(YAW_SERVO_ID, positionYaw, 0, 2000);
-  */
-
-  delay(20);
-  // YAW TEST  (BAD)
-  /*    
-        mag.read();
-        // Calculate azimuth (yaw) using the magnetometer
-        float yaw = getAzimuth(mag.m.x, mag.m.y);
-
-        // Low-pass filter to smooth the yaw value
-        filteredYaw = ALPHA * yaw + (1.0 - ALPHA) * filteredYaw;
-
-        // Calculate the compensation angle
-        float compensationAngle = targetAzimuth - filteredYaw;
-
-        // Map the compensation angle to the servo's position range
-        int position = map(compensationAngle, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
-        position = constrain(position, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
-
-        // Send the position to the servo
-        sc.WritePos(YAW_SERVO_ID, position, 0, 1500);
-        LOG(position);
-
-        delay(20); // Main loop delay  */  
+  delay(100); 
 }
 
-/*
- * Normalization of accelerometer raw data
- */
+void aimedDirectionSetup(void) {  
+  float controlHeading; 
+  // Fix the required direction
+  aimed_heading = 0;
+  magHistoryPosition = 0;
+
+  while (magHistoryPosition < SMOOTHING_STEPS)
+  {
+    controlHeading = heading();
+    pitchHistory[magHistoryPosition] = (pitch * 180) / PI;
+    aimed_heading += controlHeading;
+    delay(50);
+    magHistoryPosition++;
+  }
+
+  magHistoryPosition = 0;
+  // aimedHeading = aimedHeading / SMOOTHING_STEPS
+  aimed_heading = controlHeading;
+
+  DEBUG_SERIAL.print("AIMED HEADING = ");
+  DEBUG_SERIAL.println(aimed_heading);
+}
+
+void setBasePosition(int* base_yaw_pos, int* base_pitch_pos) {
+  // Take "sample_num"(40) samples of position feedback of each axis
+  int sample_num = 40;
+  int yaw_pos_sum = 0;
+  int pitch_pos_sum = 0;
+  int yaw_pos_data[sample_num] = {0};
+  int pitch_pos_data[sample_num] = {0};
+
+  for(int i = 0; i < sample_num; i++) {
+    yaw_pos_data[i] = sc.ReadPos(YAW_SERVO_ID);
+    pitch_pos_data[i] = sc.ReadPos(PITCH_SERVO_ID);
+    delay(10); // delay for stability
+  }
+
+  // get average and set BASE
+  for(int i = 0; i < sample_num; i++) {
+    yaw_pos_sum += yaw_pos_data[i];
+    pitch_pos_sum += pitch_pos_data[i];
+  }
+
+  *base_yaw_pos = yaw_pos_sum / sample_num;
+  *base_pitch_pos = pitch_pos_sum / sample_num;
+
+  #ifdef DEBUG
+    DEBUG_SERIAL.print("YAW BASE = ");
+    DEBUG_SERIAL.print(*base_yaw_pos);
+    DEBUG_SERIAL.print(", ");
+    DEBUG_SERIAL.print("PITCH BASE = ");
+    DEBUG_SERIAL.print(*base_pitch_pos);
+    DEBUG_SERIAL.println(".");
+  #endif
+} 
+
 void normalize(float *x, float *y, float *z)
 {
     float length = sqrt((*x) * (*x) + (*y) * (*y) + (*z) * (*z));
@@ -461,66 +476,22 @@ double Kalman_filter(double angle, double gyroRate, double accelAngle) {
   return angle;
 }
 
-void setBasePosition(int* base_yaw_pos, int* base_pitch_pos) {
-  // Take 40 samples of position feedback of each axis
-  int sample_num = 40;
-  int yaw_pos_sum = 0;
-  int pitch_pos_sum = 0;
-  int yaw_pos_data[sample_num] = {0};
-  int pitch_pos_data[sample_num] = {0};
+/*    while(1) {
+      // Pitch
+      base_servo_pitch_degrees = map(sc.ReadPos(PITCH_SERVO_ID), PITCH_MIN_LIMIT, PITCH_MAX_LIMIT, PITCH_MIN_ANGLE, PITCH_MAX_ANGLE);
+      base_servo_pitch_degrees = constrain(base_servo_pitch_degrees, PITCH_MIN_ANGLE, PITCH_MAX_ANGLE);
 
-  for(int i = 0; i < sample_num; i++) {
-    yaw_pos_data[i] = sc.ReadPos(YAW_SERVO_ID);
-    pitch_pos_data[i] = sc.ReadPos(PITCH_SERVO_ID);
-    delay(10); // delay for stability
-  }
+      // Yaw
+      base_servo_yaw_degrees = map(sc.ReadPos(YAW_SERVO_ID), YAW_MIN_LIMIT, YAW_MAX_LIMIT, YAW_MIN_ANGLE, YAW_MAX_ANGLE);
+      base_servo_yaw_degrees = constrain(base_servo_yaw_degrees, YAW_MIN_ANGLE, YAW_MAX_ANGLE);
 
-  // get average and set BASE
-  for(int i = 0; i < sample_num; i++) {
-    yaw_pos_sum += yaw_pos_data[i];
-    pitch_pos_sum += pitch_pos_data[i];
-  }
-
-  *base_yaw_pos = yaw_pos_sum / sample_num;
-  *base_pitch_pos = pitch_pos_sum / sample_num;
-
-  #ifdef DEBUG
-    DEBUG_SERIAL.print("YAW BASE = ");
-    DEBUG_SERIAL.print(*base_yaw_pos);
-    DEBUG_SERIAL.print(", ");
-    DEBUG_SERIAL.print("PITCH BASE = ");
-    DEBUG_SERIAL.print(*base_pitch_pos);
-    DEBUG_SERIAL.println(".");
-  #endif
-}
-
-void setImuBasePosition(void) {
-  float controlHeading;
-  
-  // 8 times blink 0.5 seconds
-  /*   for (int i = 0; i < 9; i++)
-  {
-    digitalWrite(LED_ONBRD_PIN, HIGH);   // turn the LED on (HIGH is the voltage level)
-    delay(500);                       // wait for a second
-    digitalWrite(LED_ONBRD_PIN, LOW);    // turn the LED off by making the voltage LOW
-    delay(500);                       // wait for a second
-  } */
-
-  // Fix the required direction
-  aimed_heading = 0;
-  magHistoryPosition = 0;
-  while (magHistoryPosition < SMOOTHING_STEPS)
-  {
-    controlHeading = heading();
-    pitchHistory[magHistoryPosition] = (pitch * 180) / PI;
-    aimed_heading += controlHeading;
-    delay(50);
-    magHistoryPosition++;
-  }
-  magHistoryPosition = 0;
-  aimed_heading = controlHeading;
-}
-
+      DEBUG_SERIAL.print("P: ");
+      DEBUG_SERIAL.print(base_servo_pitch_degrees);
+      DEBUG_SERIAL.print(" Y: ");
+      DEBUG_SERIAL.println(base_servo_yaw_degrees);
+      delay(200);
+    }  
+    */
 
 /*
   float currentHeading;
@@ -528,7 +499,6 @@ void setImuBasePosition(void) {
   float currentRoll;
 
   // Compute heading
-  currentHeading = heading();
   currentPitch = 0;
   currentRoll = 0;
 
@@ -568,4 +538,92 @@ void setImuBasePosition(void) {
       sc.WritePos(PITCH_SERVO_ID, map(AIMED_PITCH + currentPitch, 0, 360, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT), 0, 50);
     }
   }
-*/
+  */
+
+/*
+  // COMBINE (NO SYNC)
+  // Read IMU data for pitch compensation
+  /*   
+    imu.read();
+    mag.read();
+
+    // Calculate azimuth (yaw) using the magnetometer data
+    //float yaw = getAzimuth(mag.m.x, mag.m.y);
+    float yaw = heading();
+    float pitch = getPitch(imu.a.x, imu.a.z); // Get raw pitch from IMU
+
+
+    // Apply low-pass filter for stability
+    filteredYaw = ALPHA * yaw + (1.0 - ALPHA) * filteredYaw;
+    filteredPitch = ALPHA * pitch + (1.0 - ALPHA) * filteredPitch;
+
+    // Calculate the compensation angle
+    float compensationAngleYaw = targetAzimuth - filteredYaw;
+    float compensationAnglePitch = targetAngle - filteredPitch;
+
+    // Map the compensation angle to the servo's position range
+    int positionYaw = map(compensationAngleYaw, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+    positionYaw = constrain(positionYaw, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+
+    int positionPitch = map(compensationAnglePitch, -60, 60, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
+    positionPitch = constrain(positionPitch, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
+
+    // Send the position to the servo
+    sc.WritePos(YAW_SERVO_ID, positionYaw, 0, 1500);
+    sc.WritePos(PITCH_SERVO_ID, positionPitch, 0, 1500);   
+    // Delay for stability
+    delay(20); */
+
+  // PITCH TEST
+
+  /*   unsigned long currentTime = millis();
+    dt = (currentTime - lastTime) / 1000.0; // Calculate time in seconds
+    if (dt == 0) dt = 0.001;               // Prevent division by zero
+    lastTime = currentTime;
+
+    pitch = Kalman_filter(pitch, mag.m.x, atan2(-imu.a.x, sqrt(imu.a.y * imu.a.y + imu.a.z * imu.a.z)) * 180.0 / M_PI);
+      
+    float compensationAnglePitch = targetAngle - pitch;
+
+    int positionPitch = map(compensationAnglePitch, -60, 60, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
+    positionPitch = constrain(positionPitch, PITCH_MIN_LIMIT, PITCH_MAX_LIMIT);
+  */
+
+  /*   
+    yaw = atan2(mag.m.x, mag.m.y); // Calculate yaw from magnetometer readings
+    float declinationAngle = -0.1783; // Declination in radians for -10° 13'
+    yaw += declinationAngle;          // Adjust for magnetic declination
+  
+    // Normalize yaw to 0-360 degrees
+    if (yaw < 0) yaw += 2 * PI;
+    if (yaw > 2 * PI) yaw -= 2 * PI;
+    yaw = yaw * 180.0 / PI; // Convert yaw to degrees
+  
+    float compensationAngleYaw = targetAngle - yaw;
+    int positionYaw = map(compensationAngleYaw, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+    positionYaw = constrain(positionYaw, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+
+    sc.WritePos(PITCH_SERVO_ID, positionPitch, 0, 2000);
+    sc.WritePos(YAW_SERVO_ID, positionYaw, 0, 2000);
+  */
+  // YAW TEST  (BAD)
+  /*    
+        mag.read();
+        // Calculate azimuth (yaw) using the magnetometer
+        float yaw = getAzimuth(mag.m.x, mag.m.y);
+
+        // Low-pass filter to smooth the yaw value
+        filteredYaw = ALPHA * yaw + (1.0 - ALPHA) * filteredYaw;
+
+        // Calculate the compensation angle
+        float compensationAngle = targetAzimuth - filteredYaw;
+
+        // Map the compensation angle to the servo's position range
+        int position = map(compensationAngle, -180, 180, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+        position = constrain(position, YAW_MIN_LIMIT, YAW_MAX_LIMIT);
+
+        // Send the position to the servo
+        sc.WritePos(YAW_SERVO_ID, position, 0, 1500);
+        LOG(position);
+
+        delay(20); // Main loop delay  */  
